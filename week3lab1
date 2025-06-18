@@ -1,0 +1,463 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Highly-available web tier with ALB, ASG and CPU stress-test button
+
+
+Parameters:
+  LatestAmazonLinuxAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+
+Resources:
+
+  # ──────────────────────────── IAM ────────────────────────────
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: { Service: [ ec2.amazonaws.com ] }
+          Action: [ 'sts:AssumeRole' ]
+      Path: /
+      Policies:
+      - PolicyName: S3AccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: [ 's3:GetObject' ]
+            Resource: [ 'arn:aws:s3:::hanson-scripts/*' ]
+
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref InstanceRole ]
+
+
+  # ──────────────────────────── VPC & subnets ────────────────────────────
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [ { Key: Name, Value: AutoScalingLabVPC } ]
+
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [ { Key: Name, Value: AutoScalingLabIGW } ]
+
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags: [ { Key: Name, Value: PublicSubnet1 } ]
+
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags: [ { Key: Name, Value: PublicSubnet2 } ]
+
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: PrivateSubnet1 } ]
+
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: PrivateSubnet2 } ]
+
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+    DependsOn: VPCGatewayAttachment
+
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+    DependsOn: VPCGatewayAttachment
+
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [ { Key: Name, Value: PublicRouteTable } ]
+
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [ { Key: Name, Value: PrivateRouteTable } ]
+
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+
+  PrivateSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ──────────────────────────── Security groups ────────────────────────────
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTP from Internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 10.0.0.0/16
+
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP only from ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+
+  # ──────────────────────────── ALB ────────────────────────────
+  
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]
+      SecurityGroups: [ !Ref LoadBalancerSecurityGroup ]
+      Type: application
+
+
+  WebServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200" }
+
+
+  WebServerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref WebServerTargetGroup
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ──────────────────────────── Launch template ────────────────────────────
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-LaunchTemplate"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmazonLinuxAMI
+        InstanceType: t2.micro
+        SecurityGroupIds: [ !Ref WebServerSecurityGroup ]
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        Monitoring:
+          Enabled: true
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log) 2>&1
+            echo "STARTING USERDATA @ $(date)"
+
+            # ── 1. Prepare stress-ng ─────────────────────────────
+            amazon-linux-extras install -y epel
+            yum install -y stress-ng
+
+            # Allow 'apache' to launch stress-ng as root & kill it
+            echo 'apache ALL=(root) NOPASSWD: /usr/bin/stress-ng' > /etc/sudoers.d/apache-stress
+            chmod 440 /etc/sudoers.d/apache-stress
+            setenforce 0 || true
+
+            # ── 2. System updates & Apache ───────────────────────
+            yum update -y
+            yum install -y httpd awscli
+            systemctl enable --now httpd
+
+            # ── 3. Apache CGI + Stress Test UI Setup ─────────────
+            if ! command -v stress-ng &>/dev/null; then
+              echo "Installing stress-ng (fallback)…"
+              amazon-linux-extras install -y epel
+              yum install -y stress-ng || true
+            fi
+
+            mkdir -p /var/www/cgi-bin
+            chmod 755 /var/www/cgi-bin
+
+            cat >/var/www/cgi-bin/instance-info <<'EOF'
+            #!/bin/bash
+            echo "Content-type: text/html"
+            echo ""
+            IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            cat <<HTML
+            <!DOCTYPE html><html lang="en"><head>
+              <meta charset="UTF-8">
+              <meta http-equiv="Cache-Control" content="no-cache">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Instance $ID</title>
+              <style>
+                body {
+                  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                  background: #f8f9fa;
+                  margin: 2rem;
+                  color: #333;
+                }
+                .card {
+                  background: #fff;
+                  padding: 2rem;
+                  border-radius: 12px;
+                  box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+                  max-width: 480px;
+                  margin: auto;
+                }
+                h2 {
+                  margin-top: 0;
+                  color: #0073e6;
+                }
+                p {
+                  margin: 0.5rem 0;
+                }
+                button {
+                  margin-top: 1rem;
+                  padding: 12px 28px;
+                  background-color: #ff4757;
+                  color: #fff;
+                  border: none;
+                  border-radius: 8px;
+                  font-size: 1rem;
+                  font-weight: bold;
+                  cursor: pointer;
+                  transition: background 0.3s ease;
+                }
+                button:hover {
+                  background-color: #e84118;
+                }
+              </style>
+            </head><body>
+              <div class="card">
+                <h2>EC2 Instance: $ID</h2>
+                <p><strong>Private IP:</strong> $IP</p>
+                <p><strong>AZ:</strong> $AZ</p>
+                <button onclick="startStress()">💥 Start CPU Stress (3 mins)</button>
+              </div>
+              <script>
+                function startStress(){
+                  fetch('/cgi-bin/stress.sh',{method:'POST'})
+                    .then(r => r.text())
+                    .then(msg => alert(msg))
+                    .catch(err => alert("Error: " + err));
+                }
+              </script>
+            </body></html>
+            HTML
+            EOF
+
+            cat >/var/www/cgi-bin/stress.sh <<'EOF'
+            #!/bin/bash
+            echo "Content-type: text/plain"
+            echo ""
+            DURATION=180
+            CORES=$(nproc)
+            sudo pkill -f "stress-ng --cpu" 2>/dev/null || true
+            if command -v stress-ng &>/dev/null; then
+              sudo stress-ng --cpu "$CORES" --cpu-method all --cpu-load 100 --timeout "$DURATION" --metrics-brief >/dev/null 2>&1 &
+            else
+              for i in $(seq 1 "$CORES"); do
+                { end=$((SECONDS+DURATION)); while ((SECONDS<end)); do :; done; } &
+              done
+            fi
+            echo "💥 Nuking CPU for ${DURATION}s on ${CORES} cores"
+            EOF
+
+            cat >/var/www/html/index.html <<'EOF'
+            <meta http-equiv="refresh" content="0; url=/cgi-bin/instance-info">
+            EOF
+
+            chmod +x /var/www/cgi-bin/*
+            chown -R apache:apache /var/www
+
+            cat >/etc/httpd/conf.d/cgi.conf <<'EOF'
+            ScriptAlias /cgi-bin/ "/var/www/cgi-bin/"
+            <Directory "/var/www/cgi-bin">
+              Options +ExecCGI
+              AddHandler cgi-script .sh
+              Require all granted
+            </Directory>
+            EOF
+
+            systemctl restart httpd
+            echo "Bootstrap complete"
+
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --resource WebServerAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  # ──────────────────────────── Auto Scaling ────────────────────────────
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      TargetGroupARNs: [ !Ref WebServerTargetGroup ]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+
+  # ──────────────────────────── Scaling policies & alarms ────────────────
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerAutoScalingGroup
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 60
+
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerAutoScalingGroup
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 300
+
+
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-out when CPU > 50 %
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+      - { Name: AutoScalingGroupName, Value: !Ref WebServerAutoScalingGroup }
+      Statistic: Average
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [ !Ref ScaleUpPolicy ]
+
+      
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-in when CPU < 30 %
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+      - { Name: AutoScalingGroupName, Value: !Ref WebServerAutoScalingGroup }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 30
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [ !Ref ScaleDownPolicy ]
